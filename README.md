@@ -36,7 +36,7 @@ aws cloudformation deploy \
   --parameter-overrides \
       DeployerAccountId="675847109412" \
       TargetAccountIds="999789015432,999465729483,999968243760" \
-      AccountAliasesJSON="`cat aliases.json`"
+      AccountAliasesJSON="`cat aliases.json | tr -d '\n'`"
 ```
 
 | Parameter | Description |
