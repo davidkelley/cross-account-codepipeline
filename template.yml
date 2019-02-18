@@ -15,6 +15,13 @@ Parameters:
       The bucket name given to the artifacts store. This parameter is 
       prefixed by the deployer account ID parameter value.
 
+  ParameterStoreKeyPrefix:
+    Type: String
+    Default: "/CodePipeline"
+    Description: |
+      The parameter store key prefix used when deploying parameters used
+      by CodePipeline resource templates. 
+
   CloudFormationExecutionRoleName:
     Type: String
     Default: DeployerCodePipelineCloudFormationExecution
@@ -118,6 +125,14 @@ Resources:
               - kms:DescribeKey
             Resource: "*"
 
+  KeyParameter:
+    Condition: IsDeployerAccount
+    Type: AWS::SSM::Parameter
+    Properties:
+      Type: String
+      Name: !Sub "${ParameterStoreKeyPrefix}/KeyArn"
+      Value: !GetAtt Key.Arn
+
   Alias:
     Condition: IsDeployerAccount
     Type: AWS::KMS::Alias
@@ -165,6 +180,14 @@ Resources:
               - StorageClass: GLACIER
                 TransitionInDays: 120
             ExpirationInDays: 240
+
+  ArtifactsParameter:
+    Condition: IsDeployerAccount
+    Type: AWS::SSM::Parameter
+    Properties:
+      Type: String
+      Name: !Sub "${ParameterStoreKeyPrefix}/ArtifactBucketName"
+      Value: !Ref Artifacts
 
   ArtifactsPolicy:
     Condition: IsDeployerAccount
@@ -323,6 +346,14 @@ Resources:
               StringEquals:
                 sts:ExternalId: !Ref DeployerAccountId
 
+  CodePipelineExecutionRoleParameter:
+    Condition: IsDeployerAccount
+    Type: AWS::SSM::Parameter
+    Properties:
+      Type: String
+      Name: !Sub "${ParameterStoreKeyPrefix}/CodePipelineExecutionRole"
+      Value: !GetAtt CodePipelineExecutionRole.Arn
+
   CodePipelineExecutionRolePolicy:
     Type: AWS::IAM::Policy
     Properties:
@@ -416,6 +447,14 @@ Resources:
             Action:
               - sts:AssumeRole
 
+  CloudFormationExecutionRoleParameter:
+    Condition: IsDeployerAccount
+    Type: AWS::SSM::Parameter
+    Properties:
+      Type: String
+      Name: !Sub "${ParameterStoreKeyPrefix}/CloudFormationExecutionRole"
+      Value: !GetAtt CloudFormationExecutionRole.Arn
+
   CloudFormationExecutionRolePolicy:
     Type: AWS::IAM::Policy
     Properties:
@@ -478,6 +517,14 @@ Resources:
             Service: !Sub "codebuild.${AWS::URLSuffix}"
         Version: 2012-10-17
       Path: /
+
+  CodeBuildExecutionRoleParameter:
+    Condition: IsDeployerAccount
+    Type: AWS::SSM::Parameter
+    Properties:
+      Type: String
+      Name: !Sub "${ParameterStoreKeyPrefix}/CodeBuildExecutionRole"
+      Value: !GetAtt CodeBuildExecutionRole.Arn
 
   CodeBuildExecutionRolePolicy:
     Condition: IsDeployerAccount
@@ -630,16 +677,6 @@ Outputs:
     Description: IAM Role Arn for CloudFormation Execution
     Value: !GetAtt CloudFormationExecutionRole.Arn
 
-  DeployerCloudFormationExecutionRoles:
-    Condition: IsDeployerAccount
-    Description: Comma delimited list of deployer CloudFormation execution IAM Role Arns
-    Value: !GetAtt FormattedCloudFormationExecutionRoleArns.Result
-
-  DeployerCodePipelineExecutionRoles:
-    Condition: IsDeployerAccount
-    Description: Comma delimited list of deployer CodePipeline execution IAM Role Arns
-    Value: !GetAtt FormattedPipelineExecutionRoleArns.Result
-  
   KeyArn:
     Condition: IsDeployerAccount
     Description: Cross-Account KMS Key Arn

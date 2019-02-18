@@ -1,0 +1,161 @@
+AWSTemplateFormatVersion: 2010-09-09
+
+Description: |
+  A simple CodePipeline example which contains a source, build and 
+  a gated deployment step into a production alised account.
+
+Parameters:
+
+  OAuthToken:
+    Type: String
+    NoEcho: true
+    Description: |
+      A valid GitHub personal access token with sufficient permissions
+      to access the repository.
+
+  ArtifactStore:
+    Type: AWS::SSM::Parameter::Value<String>
+    Default: /CodePipeline/ArtifactBucketName
+
+  KMSKey:
+    Type: AWS::SSM::Parameter::Value<String>
+    Default: /CodePipeline/KeyArn
+
+  CloudformationExecutionRole:
+    Type: AWS::SSM::Parameter::Value<String>
+    Default: /CodePipeline/CloudFormationExecutionRole
+
+  CodePipelineExecutionRole:
+    Type: AWS::SSM::Parameter::Value<String>
+    Default: /CodePipeline/CodePipelineExecutionRole
+
+  CodeBuildExecutionRole:
+    Type: AWS::SSM::Parameter::Value<String>
+    Default: /CodePipeline/CodeBuildExecutionRole
+
+  Repository:
+    Type: String
+    AllowedPattern: "^[-_a-zA-Z0-9]+/[-_a-zA-Z0-9]+$"
+    ConstraintDescription: |
+      Ensure you have defined a full path, including the username or
+      organisation name.
+    Description: |
+      The full name of the repository, such as "<username>/<name>".
+
+  Branch:
+    Type: String
+    Description: Branch to use from the repository.
+    Default: master
+    
+Resources:
+
+  Pipeline:
+    Type: AWS::CodePipeline::Pipeline
+    Properties:
+      RoleArn: !Ref CodePipelineExecutionRole
+      ArtifactStore:
+        Type: S3 
+        Location: !Ref ArtifactStore
+        EncryptionKey:
+          Type: KMS
+          Id: !Ref KMSKey
+      Stages:
+        - Name: Source
+          Actions:
+            - Name: GitHub
+              ActionTypeId:
+                Category: Source
+                Owner: ThirdParty
+                Version: 1
+                Provider: GitHub
+              OutputArtifacts:
+                - Name: GitHubOutput
+              Configuration:
+                Owner: !Select [ 0, !Split [ "/", !Ref Repository ] ]
+                Repo: !Select [ 1, !Split [ "/", !Ref Repository ] ]
+                Branch: !Ref Branch
+                OAuthToken: !Ref OAuthToken
+                PollForSourceChanges: false
+        - Name: Build
+          Actions:
+            - Name: Build
+              InputArtifacts:
+                - Name: GitHubOutput
+              OutputArtifacts:
+                - Name: BuildOutput
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Version: 1
+                Provider: CodeBuild
+              Configuration:
+                ProjectName: !Ref Build
+                PrimarySource: GitHubOutput
+        - Name: Production
+          Actions:
+            - Name: Approval
+              RunOrder: 1
+              ActionTypeId:
+                Category: Approval
+                Owner: AWS
+                Provider: Manual
+                Version: 1
+              Configuration:
+                CustomData: "Do you approve this service being deployed?"
+            - Name: Service
+              RunOrder: 2
+              ActionTypeId:
+                Category: Deploy
+                Owner: AWS
+                Provider: CloudFormation
+                Version: 1
+              RoleArn:
+                Fn::Transform:
+                  - Name: AccountRoleAlias
+                    Parameters:
+                      Alias: Production
+                      Service: CodePipeline
+              InputArtifacts:
+                - Name: BuildOutput
+              Configuration:
+                ActionMode: CREATE_UPDATE
+                Capabilities: CAPABILITY_IAM,CAPABILITY_AUTO_EXPAND
+                RoleArn:
+                  Fn::Transform:
+                    - Name: AccountRoleAlias
+                      Parameters:
+                        Alias: Production
+                        Service: CloudFormation
+                TemplatePath: BuildOutput::packaged.yml
+                StackName: !Join
+                  - '-'
+                  - - !Select [ 0, !Split [ "/", !Ref Repository ] ]
+                    - !Select [ 1, !Split [ "/", !Ref Repository ] ]
+
+  PipelineTrigger:
+    Type: AWS::CodePipeline::Webhook
+    Properties:
+      AuthenticationConfiguration:
+        SecretToken: !Ref AWS::StackName
+      Filters:
+        - JsonPath: "$.ref"
+          MatchEquals: refs/heads/{Branch}
+      Authentication: GITHUB_HMAC
+      TargetPipeline: !Ref Pipeline
+      TargetPipelineVersion: !GetAtt Pipeline.Version
+      TargetAction: GitHub
+      RegisterWithThirdParty: true
+     
+  Build:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      EncryptionKey: !Ref KMSKey
+      ServiceRole: !Ref CodeBuildExecutionRole
+      Source:
+        Type: CODEPIPELINE
+      Environment:
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/nodejs:8.11.0
+        Type: LINUX_CONTAINER
+      Artifacts:
+        Type: CODEPIPELINE
