@@ -1,0 +1,651 @@
+AWSTemplateFormatVersion: 2010-09-09
+
+Transform: AWS::Serverless-2016-10-31
+
+Description: |
+  Configures cross-account CodePipeline and artifact permissions
+  for deploying CloudFormation templates.
+
+Parameters:
+
+  ArtifactsBucketName:
+    Type: String
+    Default: artifacts-store
+    Description: |
+      The bucket name given to the artifacts store. This parameter is 
+      prefixed by the deployer account ID parameter value.
+
+  CloudFormationExecutionRoleName:
+    Type: String
+    Default: DeployerCodePipelineCloudFormationExecution
+    Description: |
+      The IAM Role name for the CloudFormation execution role
+      assumed by CodePipeline.
+
+  CodePipelineExecutionRoleName:
+    Type: String
+    Default: DeployerCodePipelineDeployerExecution
+    Description: |
+      The name for the IAM Role which is assumed from the deployer
+      account to execute actions in an target account.
+
+  LambdaACLExecutionRoleName:
+    Type: String
+    Default: DeployerLambdaACLExecution
+    Description: |
+      The name for the IAM Role which is assumed from the deployer
+      account to execute actions in an target account.
+
+  DeployerAccountId:
+    Type: String
+    Description: |
+      The ID of the deployer account; this account will contain the
+      CodePipeline deployments.
+
+  AccountAliasesJSON:
+    Type: String
+    Description: |
+      A key value mapping of account aliases and account ids in
+      stringified JSON format.
+
+  TargetAccountIds:
+    Type: String
+    Description: |
+      The Account IDs being targeted for deployments from the
+      deployer account.
+
+Conditions:
+
+  IsDeployerAccount: !Equals [ !Ref DeployerAccountId, !Ref "AWS::AccountId" ]
+
+  IsNotDeployerAccount: !Not [ !Condition IsDeployerAccount ]
+
+Globals:
+
+  Function:
+    Runtime: nodejs6.10
+    Handler: index.handler
+    Timeout: 60
+
+Resources:
+
+  Key:
+    Condition: IsDeployerAccount
+    Type: AWS::KMS::Key
+    Properties:
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: "2012-10-17"
+        Id: !Ref AWS::StackName
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !Sub arn:aws:iam::${AWS::AccountId}:root
+            Action:
+              - "kms:Create*"
+              - "kms:Describe*"
+              - "kms:Enable*"
+              - "kms:List*"
+              - "kms:Put*"
+              - "kms:Update*"
+              - "kms:Revoke*"
+              - "kms:Disable*"
+              - "kms:Get*"
+              - "kms:Delete*"
+              - "kms:ScheduleKeyDeletion"
+              - "kms:CancelKeyDeletion"
+            Resource: "*"
+          - Effect: Allow
+            Principal:
+              AWS:
+                - !GetAtt CodeBuildExecutionRole.Arn
+                - !Sub arn:aws:iam::${AWS::AccountId}:root
+            Action:
+              - kms:Encrypt
+              - kms:Decrypt
+              - kms:ReEncrypt*
+              - kms:GenerateDataKey*
+              - kms:DescribeKey
+            Resource: "*"
+          - Effect: Allow
+            Principal:
+              AWS: !GetAtt FormattedRootAccountExecutionRoleArns.Result
+            Action:
+              - kms:Encrypt
+              - kms:Decrypt
+              - kms:ReEncrypt*
+              - kms:GenerateDataKey*
+              - kms:DescribeKey
+            Resource: "*"
+
+  Alias:
+    Condition: IsDeployerAccount
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: !Sub alias/codepipeline-crossaccounts
+      TargetKeyId: !Ref Key
+
+  Artifacts:
+    Condition: IsDeployerAccount
+    DependsOn: ArtifactsLambdaPermission
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    Properties:
+      BucketName: !Sub "${AWS::AccountId}-${ArtifactsBucketName}"
+      AccessControl: AuthenticatedRead
+      VersioningConfiguration:
+        Status: Enabled
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: aws:kms
+              KMSMasterKeyID: !Ref Key
+      NotificationConfiguration:
+        LambdaConfigurations:
+          - Event: s3:ObjectCreated:*
+            Function: !GetAtt ArtifactACLModifierFunction.Arn
+      LifecycleConfiguration:
+        Rules:
+          - Status: Enabled
+            NoncurrentVersionTransitions:
+              - StorageClass: STANDARD_IA
+                TransitionInDays: 30
+              - StorageClass: GLACIER
+                TransitionInDays: 60
+            NoncurrentVersionExpirationInDays: 120
+          - Status: Enabled
+            Transitions:
+              - StorageClass: STANDARD_IA
+                TransitionInDays: 60
+              - StorageClass: GLACIER
+                TransitionInDays: 120
+            ExpirationInDays: 240
+
+  ArtifactsPolicy:
+    Condition: IsDeployerAccount
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref Artifacts
+      PolicyDocument:
+        Statement:
+          - Effect: Deny
+            Principal: "*"
+            Action: s3:PutObject
+            Resource: !Sub "${Artifacts.Arn}/*"
+            Condition:
+              StringNotEquals:
+                s3:x-amz-server-side-encryption: aws:kms
+          - Effect: Deny
+            Principal: "*"
+            Action: "s3:*"
+            Resource: !Sub "${Artifacts.Arn}/*"
+            Condition:
+              Bool:
+                aws:SecureTransport: false
+          - Effect: Allow
+            Principal:
+              AWS: !GetAtt FormattedRootAccountExecutionRoleArns.Result
+            Action:
+              - "s3:*"
+            Resource: 
+              - !GetAtt Artifacts.Arn
+              - !Sub "${Artifacts.Arn}/*"
+          - Effect: Allow
+            Principal:
+              AWS:
+                - !Sub "arn:aws:iam::${AWS::AccountId}:root" 
+                - !GetAtt CodeBuildExecutionRole.Arn
+            Action:
+              - "s3:*"
+            Resource: 
+              - !GetAtt Artifacts.Arn
+              - !Sub "${Artifacts.Arn}/*"
+
+  ArtifactsLambdaPermission:
+    Condition: IsDeployerAccount
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt ArtifactACLModifierFunction.Arn
+      Action: lambda:InvokeFunction
+      Principal: s3.amazonaws.com
+      SourceAccount: !Ref AWS::AccountId
+
+  ArtifactACLModifierFunction:
+    Condition: IsDeployerAccount
+    Type: AWS::Serverless::Function
+    Properties:
+      Role: !GetAtt ArtifactACLModifierFunctionExecutionRole.Arn
+      InlineCode: |
+        const { S3, TemporaryCredentials } = require('aws-sdk');
+        const { ROLE_NAME, ACCOUNT_IDS, EXTERNAL_ID, ACL, AWS_REGION } = process.env;
+        const roles = ACCOUNT_IDS.split(',').map(id => new TemporaryCredentials({
+          RoleArn: `arn:aws:iam::${id}:role/${ROLE_NAME}`,
+          ExternalId: EXTERNAL_ID,
+        }));
+        exports.handler = (event, ctx, cb) => {
+          const { Records: [{ s3: { bucket: { name: Bucket }, object: { key: Key } } }]} = event;
+          Promise.all(roles.map(credentials => new Promise((resolve, reject) => {
+            credentials.refresh((err) => {
+              if (err) return reject(err);
+              const s3 = new S3({ credentials, region: AWS_REGION });
+              s3.putObjectAcl({ Bucket, Key, ACL }).promise().then(resolve).catch(err => {
+                console.error(err);
+                resolve(true);
+              });
+            })
+          }))).then((vals) => cb(null, vals)).catch(cb)
+        };
+      Environment:
+        Variables:
+          ROLE_NAME: !Ref CodePipelineExecutionRoleName
+          EXTERNAL_ID: !Ref DeployerAccountId
+          ACL: authenticated-read
+          ACCOUNT_IDS: !Join
+            - ','
+            - - !Ref AWS::AccountId
+              - !Join [ ',', !Ref TargetAccountIds ]
+  
+  ArtifactACLModifierFunctionLogGroup:
+    Condition: IsDeployerAccount
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${ArtifactACLModifierFunction}"
+      RetentionInDays: 1
+
+  ArtifactACLModifierFunctionExecutionRole:
+    Condition: IsDeployerAccount
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Ref LambdaACLExecutionRoleName
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: !Sub "lambda.${AWS::URLSuffix}"
+            Action:
+              - sts:AssumeRole
+      Path: /
+      ManagedPolicyArns:
+        - !Ref CodePipelineExecutionSharedPolicy
+        - !Sub "arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+      Policies:
+        - PolicyName: PutObjectAclPermissions
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+            - Effect: Allow
+              Resource: "*"
+              Action:
+                - s3:PutObjectAcl
+
+  CodePipelineExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Path: /
+      RoleName: !Ref CodePipelineExecutionRoleName
+      ManagedPolicyArns:
+        - !Ref CodePipelineExecutionSharedPolicy
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - codepipeline.amazonaws.com
+            Action:
+              - sts:AssumeRole
+          - Effect: Allow
+            Principal:
+              AWS:
+                - !Ref DeployerAccountId
+            Action:
+              - sts:AssumeRole
+          - Effect: Allow
+            Principal:
+              AWS: !Ref TargetAccountIds
+            Action:
+              - sts:AssumeRole
+          - Effect: Allow
+            Principal:
+              AWS: !If
+                - IsDeployerAccount
+                - !GetAtt ArtifactACLModifierFunctionExecutionRole.Arn
+                - !Sub "arn:${AWS::Partition}:iam::${DeployerAccountId}:role/${LambdaACLExecutionRoleName}"
+            Action:
+              - sts:AssumeRole
+            Condition:
+              StringEquals:
+                sts:ExternalId: !Ref DeployerAccountId
+
+  CodePipelineExecutionRolePolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: CodePipelineExecutionPolicy
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Action:
+              - sts:AssumeRole
+            Effect: Allow
+            Resource:
+              - !GetAtt CloudFormationExecutionRole.Arn
+          - !If
+            - IsDeployerAccount
+            - Action:
+                - codecommit:GetBranch
+                - codecommit:GetCommit
+                - codecommit:UploadArchive
+                - codecommit:GetUploadArchiveStatus
+                - codecommit:CancelUploadArchive
+              Effect: Allow
+              Resource:
+                - "*"
+            - !Ref AWS::NoValue
+          - Action:
+              - codebuild:BatchGet*
+              - codebuild:ListBuilds*
+              - codebuild:StartBuild
+              - codebuild:StopBuild
+            Effect: Allow
+            Resource: 
+              - "*"
+          - Action:
+              - lambda:*
+              - cloudformation:*
+              - s3:*
+              - iam:PassRole
+            Effect: Allow
+            Resource: 
+              - "*"
+      Roles:
+        - !Ref CodePipelineExecutionRole
+
+  CodePipelineExecutionSharedPolicy: 
+    Type: AWS::IAM::ManagedPolicy
+    Properties: 
+      Description: "Policy for assuming cross-account resources"
+      Path: "/"
+      PolicyDocument: 
+        Version: "2012-10-17"
+        Statement: 
+          - Action:
+              - kms:*
+            Effect: Allow
+            Resource: !If 
+              - IsDeployerAccount
+              - !GetAtt Key.Arn
+              - !Sub "arn:aws:kms:${AWS::Region}:${DeployerAccountId}:key/*"
+          - !If
+            - IsDeployerAccount
+            - Action:
+                - sts:AssumeRole
+              Effect: Allow
+              Resource: !GetAtt FormattedPipelineExecutionRoleArns.Result 
+            - Action:
+                - sts:AssumeRole
+              Effect: Allow
+              Resource:
+                - !Sub "arn:aws:iam::${DeployerAccountId}:role/${CodePipelineExecutionRoleName}"
+          - Action:
+              - "s3:Get*"
+              - "s3:Put*"
+              - "s3:List*"
+            Effect: Allow
+            Resource:
+              - !Sub "arn:${AWS::Partition}:s3:::${DeployerAccountId}-${ArtifactsBucketName}"
+              - !Sub "arn:${AWS::Partition}:s3:::${DeployerAccountId}-${ArtifactsBucketName}/*"
+
+  CloudFormationExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Ref CloudFormationExecutionRoleName
+      Path: /
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - cloudformation.amazonaws.com
+            Action:
+              - sts:AssumeRole
+
+  CloudFormationExecutionRolePolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: CloudFormationExecutionPolicy
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Action:
+              - apigateway:*
+              - application-autoscaling:*
+              - cloudformation:*
+              - cloudfront:*
+              - cloudwatch:*
+              - codebuild:*
+              - codepipeline:*
+              - cognito-idp:*
+              - cognito-identity:*
+              - dynamodb:*
+              - events:*
+              - batch:*
+              - iam:*
+              - lambda:*
+              - logs:*
+              - kms:*
+              - rds:*
+              - route53:*
+              - s3:*
+              - sns:*
+              - ssm:*
+              - ec2:*
+              - ecs:*
+              - ecr:*
+              - elasticloadbalancing:*
+              - autoscaling:*
+              - waf:*
+            Effect: Allow
+            Resource: "*"
+          - Action:
+              - s3:PutObject
+              - s3:PutObjectAcl
+              - s3:GetBucketPolicy
+              - s3:GetObject
+              - s3:ListBucket
+            Effect: Allow
+            Resource:
+              - !Sub "arn:${AWS::Partition}:s3:::${DeployerAccountId}-${ArtifactsBucketName}"
+              - !Sub "arn:${AWS::Partition}:s3:::${DeployerAccountId}-${ArtifactsBucketName}/*"
+      Roles:
+        - !Ref CloudFormationExecutionRole
+
+  CodeBuildExecutionRole:
+    Condition: IsDeployerAccount
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+        - Action: sts:AssumeRole
+          Effect: Allow
+          Principal:
+            Service: !Sub "codebuild.${AWS::URLSuffix}"
+        Version: 2012-10-17
+      Path: /
+
+  CodeBuildExecutionRolePolicy:
+    Condition: IsDeployerAccount
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: CodeBuildArtifactAccess
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Action:
+              - kms:*
+            Resource:
+              - !GetAtt Key.Arn
+          - Action:
+              - 'ec2:CreateNetworkInterfacePermission'
+              - 'ec2:CreateNetworkInterface'
+              - 'ec2:DescribeDhcpOptions'
+              - 'ec2:DescribeNetworkInterfaces'
+              - 'ec2:DeleteNetworkInterface'
+              - 'ec2:DescribeSubnets'
+              - 'ec2:DescribeSecurityGroups'
+              - 'ec2:DescribeVpcs'
+            Effect: Allow
+            Resource:
+              - '*'
+          - Action:
+              - 's3:*'
+              - 'ecr:*'
+            Effect: Allow
+            Resource:
+              - "*"
+          - Action:
+              - 'logs:CreateLogGroup'
+              - 'logs:CreateLogStream'
+              - 'logs:PutLogEvents'
+            Effect: Allow
+            Resource: '*'
+      Roles:
+        - !Ref CodeBuildExecutionRole
+
+  FormattedRootAccountExecutionRoleArns:
+    Condition: IsDeployerAccount
+    Type: Custom::Format
+    Properties:
+      ServiceToken: !GetAtt FormatFunction.Arn
+      Format: !Sub "arn:aws:iam::%s:root"
+      List: !Ref TargetAccountIds
+
+  FormattedCloudFormationExecutionRoleArns:
+    Condition: IsDeployerAccount
+    Type: Custom::Format
+    Properties:
+      ServiceToken: !GetAtt FormatFunction.Arn
+      Format: !Sub "arn:aws:iam::%s:role/${CloudFormationExecutionRoleName}"
+      List: !Ref TargetAccountIds
+
+  FormattedPipelineExecutionRoleArns:
+    Condition: IsDeployerAccount
+    Type: Custom::Format
+    Properties:
+      ServiceToken: !GetAtt FormatFunction.Arn
+      Format: !Sub "arn:aws:iam::%s:role/${CodePipelineExecutionRoleName}"
+      List: !Ref TargetAccountIds
+
+  FormatFunction:
+    Condition: IsDeployerAccount
+    Type: AWS::Serverless::Function
+    Properties:
+      InlineCode: |
+        const response = require('cfn-response');
+        const { format } = require('util');
+        exports.handler = (event, context) => {
+          try {
+            if (event.RequestType == 'Delete') {
+              return response.send(event, context, response.SUCCESS);
+            }
+            const { Format = '', List } = event.ResourceProperties;
+            const formatted = List.map(el => format(Format, ...el));
+            const id = Buffer.from(formatted).toString('base64');
+            response.send(event, context, response.SUCCESS, { Result: formatted }, id);
+          } catch (err) {
+            response.send(event, context, response.FAILED, { Error: err.message }, null);
+          }
+        };
+
+  FormatFunctionLogGroup:
+    Condition: IsDeployerAccount
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${FormatFunction}"
+      RetentionInDays: 1
+
+  AccountRoleAliasFunction:
+    Condition: IsDeployerAccount
+    Type: AWS::Serverless::Function
+    Properties:
+      InlineCode: |
+        const { SERVICE_ROLES, ALIASES } = process.env;
+        exports.handler = ({ requestId, params: { Alias, Service } }, ctx, cb) => cb(null, { 
+          fragment: `arn:aws:iam::${JSON.parse(ALIASES)[Alias]}:role/${JSON.parse(SERVICE_ROLES)[Service]}`,
+          status: 'success',
+          requestId,
+        });
+      Environment:
+        Variables:
+          ALIASES: !Ref AccountAliasesJSON
+          SERVICE_ROLES: !Sub |
+            {
+              "CodePipeline": "${CodePipelineExecutionRoleName}",
+              "CloudFormation": "${CloudFormationExecutionRoleName}"
+            }
+
+  AccountRoleAliasFunctionLogGroup:
+    Condition: IsDeployerAccount
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${AccountRoleAliasFunction}"
+      RetentionInDays: 1
+
+  AccountRoleAliasFunctionPermissions:
+    Condition: IsDeployerAccount
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !GetAtt AccountRoleAliasFunction.Arn
+      Principal: !Sub "cloudformation.${AWS::URLSuffix}"
+
+  AccountRoleAliasFunctionTransform:
+    Condition: IsDeployerAccount
+    Type: AWS::CloudFormation::Macro
+    Properties:
+        Name: AccountRoleAlias
+        Description: |
+          Returns an IAM Role for a target account based upon its alias.
+        FunctionName: !GetAtt AccountRoleAliasFunction.Arn
+
+Outputs:
+
+  CodePipelineExecutionRole:
+    Description: IAM Role Arn for CodePipeline Execution
+    Value: !GetAtt CodePipelineExecutionRole.Arn
+
+  CodeBuildExecutionRoleArn:
+    Condition: IsDeployerAccount
+    Description: IAM Role Arn for CodeBuild Execution
+    Value: !GetAtt CodeBuildExecutionRole.Arn
+
+  CloudFormationExecutionRole:
+    Description: IAM Role Arn for CloudFormation Execution
+    Value: !GetAtt CloudFormationExecutionRole.Arn
+
+  DeployerCloudFormationExecutionRoles:
+    Condition: IsDeployerAccount
+    Description: Comma delimited list of deployer CloudFormation execution IAM Role Arns
+    Value: !GetAtt FormattedCloudFormationExecutionRoleArns.Result
+
+  DeployerCodePipelineExecutionRoles:
+    Condition: IsDeployerAccount
+    Description: Comma delimited list of deployer CodePipeline execution IAM Role Arns
+    Value: !GetAtt FormattedPipelineExecutionRoleArns.Result
+  
+  KeyArn:
+    Condition: IsDeployerAccount
+    Description: Cross-Account KMS Key Arn
+    Value: !GetAtt Key.Arn
+
+  ArtifactBucketName:
+    Condition: IsDeployerAccount
+    Description: The bucket to use for storing deployable artifacts (CF templates, zips etc)
+    Value: !Ref Artifacts
