@@ -4,15 +4,15 @@ The AWS CloudFormation template in this repository can be deployed in both a _"D
 
 ![Diagram](.github/images/diagram.png "Cross-Account CodePipeline Diagram")
 
-Cross-account CodePipeline artifacts also have their ACL modified by a Lambda function to ensure the deployer account can access them in subsequent actions within the pipeline.
+Cross-account CodePipeline artifacts also have their ACL modified by a Lambda function to ensure the deployer account can access them in subsequent actions within the pipeline. For example, this would allow you to use the outputs of one CloudFormation deployment in one target account, as the parameters in another deployment in a separate account.
 
-When implementing cross-account pipelines, a macro is provided (as demonstrated in the example template) to enable you to alias accounts with the target IAM role arns; enabling templates to refer to target accounts by alias, as opposed to any hardcoded account IDs. The configuration of this is documented below.
+This template also creates a CloudFormation macro (as demonstrated in the example template) to enable you to alias accounts with the target IAM role arns; enabling templates to refer to target accounts by alias, as opposed to using hardcoded account IDs. Configuring aliases and the macro is documented below.
 
-Where possible, roles and policies are locked down to ensure that objects are secured and encrypted.
+Wherever possible, roles and policies are locked down to ensure that objects are secured and encrypted providing only access to required resources. _Therefore, depending on your use case, you may discover that the deployed CloudFormation execution role has insufficient permissions, so you will need to update these as necessary._
 
 ## Getting Started
 
-Before doing anything, create an `aliases.json` file, which contains a map between logical account names, such as "Dev", "Staging" and "Production", with the associated AWS Account IDs, as described in the example below.
+_Clone this repository._ Before doing anything else, create an `aliases.json` file, which contains a map between logical account names, such as "Dev", "Staging" and "Production", with the associated AWS Account IDs, as described in the example below.
 
 ```json
 {
@@ -22,21 +22,21 @@ Before doing anything, create an `aliases.json` file, which contains a map betwe
 }
 ```
 
-> These aliases are used within a [CloudFormation Macro](), to help generate IAM Role Arns to the aliases mapped within the file. They also help you to easily identify which account an action is being performed on within the pipeline. Usage of this macro is demonstrated within the provided examples.
+> These aliases are used within a [CloudFormation Macro](https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/template-macros.html), to help generate IAM Role Arns to the aliases mapped within the file. They also help you to easily identify which account an action is being performed on within the pipeline. Usage of this macro is demonstrated within the provided examples.
 
 Once you've created the aliases you wish to use, the content will be used within the `AccountAliasesJSON` parameter when deploying the CloudFormation template. 
 
-At this point, if you're happy using the provided defaults, you're ready to deploy the template. You will need to repeat the command for every account you wish to enable cross-account deployments on, this includes the deployer account. Try executing the following command:
+At this point, if you're happy using the provided defaults, you're ready to deploy the template. **You will need to repeat the command for every account you wish to enable cross-account deployments on**, this includes the deployer account. Try executing the following command:
 
 ```shell
 aws cloudformation deploy \
   --template-file template.yml \
   --stack-name cross-account-codepipeline \
-  --capabilities CAPABILITY_NAMED_IAM
+  --capabilities CAPABILITY_AUTO_EXPAND CAPABILITY_NAMED_IAM \
   --parameter-overrides \
       DeployerAccountId="675847109412" \
       TargetAccountIds="999789015432,999465729483,999968243760" \
-      AccountAliasesJSON=`cat aliases.json`
+      AccountAliasesJSON="`cat aliases.json`"
 ```
 
 | Parameter | Description |
